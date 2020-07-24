@@ -1,13 +1,55 @@
 import com.typesafe.config.ConfigFactory
 import org.joda.time.DateTime
-import slick.jdbc.{GetResult, JdbcBackend, JdbcProfile, MySQLProfile}
+import slick.jdbc.{GetResult, JdbcBackend, JdbcCapabilities, JdbcProfile, MySQLProfile, PositionedParameters, SetParameter}
 
 import scala.async.Async._
 import scala.concurrent._
+import com.github.tminglei.slickpg._
+import play.api.libs.json.{JsValue, Json}
+import slick.basic.Capability
+
+trait MyPostgresProfile extends ExPostgresProfile
+  with PgArraySupport
+  with PgDate2Support
+  with PgDateSupportJoda
+  with PgRangeSupport
+  with PgHStoreSupport
+  with PgPlayJsonSupport
+  with PgSearchSupport
+  with PgNetSupport
+  with PgLTreeSupport {
+  def pgjson = "jsonb" // jsonb support is in postgres 9.4.0 onward; for 9.3.x use "json"
+
+  // Add back `capabilities.insertOrUpdate` to enable native `upsert` support; for postgres 9.5+
+  override protected def computeCapabilities: Set[Capability] =
+    super.computeCapabilities + JdbcCapabilities.insertOrUpdate
+
+  override val api = MyAPI
+
+  object MyAPI extends API with ArrayImplicits
+    with DateTimeImplicits
+    with JsonImplicits
+    with NetImplicits
+    with LTreeImplicits
+    with RangeImplicits
+    with HStoreImplicits
+    with SearchImplicits
+    with SearchAssistants {
+    implicit val strListTypeMapper = new SimpleArrayJdbcType[String]("text").to(_.toList)
+    implicit val playJsonArrayTypeMapper =
+      new AdvancedArrayJdbcType[JsValue](pgjson,
+        (s) => utils.SimpleArrayUtils.fromString[JsValue](Json.parse(_))(s).orNull,
+        (v) => utils.SimpleArrayUtils.mkString[JsValue](_.toString())(v)
+      ).to(_.toList)
+  }
+}
+
+object MyPostgresProfile extends MyPostgresProfile
 
 object DispatcherServer extends App {
 
   private val config = ConfigFactory.load()
+
 
   private val source: MySQLProfile.backend.Database = {
     import slick.jdbc.MySQLProfile.api._
@@ -129,7 +171,7 @@ object DispatcherServer extends App {
       import slick.jdbc.MySQLProfile.api._
 
       implicit val getLanguage = GetResult(r =>
-      Language(r.nextLong(), r.nextString(), r.nextString()))
+      Language(r.nextLong(), r.nextString().stripPrefix("."), r.nextString()))
 
       source.run(sql"""select ID, Ext, Name from Languages where Contest = 1""".as[Language])
     }
@@ -145,12 +187,26 @@ object DispatcherServer extends App {
       source.run(sql"""select Contest, Team, Problem, SrcLang, Id, Arrived, INET_NTOA(Computer) from NewSubmits""".as[Submit])
     }
 
-    val languageMap = languages.map(v => v.copy(ext = v.ext.stripPrefix("."))).groupBy(_.ext).view.mapValues(_.head)
+    case class CustomTest(id: Long, contest: Long, team: Long, language: String, source: Array[Byte], input: Array[Byte], arrived: DateTime)
 
-    import slick.jdbc.PostgresProfile.api._
+    val customTests = await {
+      import slick.jdbc.MySQLProfile.api._
+      implicit val getCust = GetResult(r =>
+        CustomTest(r.<<, r.<<, r.<<, r.<<, r.nextBytes(), r.nextBytes(), new DateTime(r.nextTimestamp()))
+      )
+
+      source.run(sql"""select ID, Contest, Team, Ext, Source, Input, Arrived from Eval""".as[CustomTest])
+    }
+
+    val languageMap = languages.groupBy(_.ext).view.mapValues(_.head)
+
+    import MyPostgresProfile.api._
     import com.github.tototoshi.slick.PostgresJodaSupport._
+    implicit object SetByteArray extends SetParameter[Array[Byte]] {
+      override def apply(v1: Array[Byte], v2: PositionedParameters): Unit = v2.setBytes(v1)
+    }
 
-    val insertLanguages = languageMap.view.mapValues { c =>
+    val insertLanguages = languages.map { c =>
       sqlu"""insert into languages (id, name, module_id) values (${c.id}, ${c.name}, ${c.ext})"""
     }
 
@@ -159,14 +215,21 @@ object DispatcherServer extends App {
             values (${c.contest}, ${c.team}, ${c.problem}, ${c.id}, ${c.lang}, ${c.source}, ${c.arrived}, ${c.computerID})"""
     }
 
+    val insertCustom = customTests.map { c =>
+      var lang = languageMap.apply(c.language.stripPrefix("."))
+      sqlu"""insert into custom_test (id, contest, team_id, language_id, source, input, submit_time_absolute) values
+            (${c.id}, ${c.contest}, ${c.team}, ${lang.id}, ${c.source}, ${c.input}, ${c.arrived})"""
+    }
+
     val clearAll = Seq(
       sqlu"""truncate table languages""",
       sqlu"""truncate table submits""",
       sqlu"truncate table testings",
-      sqlu"truncate table results"
+      sqlu"truncate table results",
+      sqlu"truncate table custom_test"
     )
 
-    val all = DBIO.sequence(clearAll ++ insertLanguages ++ insertSubmits)
+    val all = DBIO.sequence(clearAll ++ insertLanguages ++ insertSubmits ++ insertCustom)
 
     await {
       dest.run(all.transactionally)
