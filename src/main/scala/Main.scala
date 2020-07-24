@@ -73,9 +73,7 @@ object DispatcherServer extends App {
           new DateTime(r.nextTimestamp()), new DateTime(r.nextTimestamp()), new DateTime(r.nextTimestamp()))
       )
 
-      val x = source.run(sql"""select ID, Name, PolygonID, Start, Finish, End, Expose from Contests""".as[Contest])
-      x.onComplete(println(_))
-      x
+      source.run(sql"""select ID, Name, PolygonID, Start, Finish, End, Expose from Contests""".as[Contest])
     }
 
     import slick.jdbc.PostgresProfile.api._
@@ -90,7 +88,7 @@ object DispatcherServer extends App {
               freeze_time = ${c.finish}, end_time = ${c.end}, expose_time = ${c.expose}"""
         }).transactionally
       )
-    }.map(println(_))
+    }
   }
 
   def copyTeams(source: JdbcBackend#DatabaseDef, dest: JdbcBackend#DatabaseDef)(implicit ec: ExecutionContext) = async {
@@ -114,7 +112,7 @@ object DispatcherServer extends App {
 
       implicit val getTeam = GetResult(r =>
         Team(r.nextLong(), r.nextLong(), r.nextLong(), r.nextString()))
-      source.run(sql"""select ID, School, Num, Name""".as[Team])
+      source.run(sql"""select ID, School, Num, Name from Teams""".as[Team])
     }
 
     val participants = await {
@@ -139,10 +137,7 @@ object DispatcherServer extends App {
     import com.github.tototoshi.slick.PostgresJodaSupport._
 
     val cleanAll = Seq(
-      sqlu"""truncate table schools""",
-      sqlu"""truncate table teams""",
-      sqlu"""truncate table participants""",
-      sqlu"""truncate table logins""",
+      sqlu"""truncate table schools, teams, participants, logins cascade""",
     )
 
     val insertSchools = schools.map { c =>
@@ -176,6 +171,8 @@ object DispatcherServer extends App {
       source.run(sql"""select ID, Ext, Name from Languages where Contest = 1""".as[Language])
     }
 
+    println("a")
+
     case class Submit(contest: Long, team: Long, problem: String, lang: Long, id: Long, arrived: DateTime, computerID: String, source: Array[Byte])
 
     val submits = await {
@@ -184,10 +181,11 @@ object DispatcherServer extends App {
         Submit(r.nextLong(), r.nextLong(), r.nextString(), r.nextLong(), r.nextLong(), new DateTime(r.nextTimestamp()), r.nextString(), r.nextBytes())
       )
 
-      source.run(sql"""select Contest, Team, Problem, SrcLang, Id, Arrived, INET_NTOA(Computer) from NewSubmits""".as[Submit])
+      source.run(sql"""select Contest, Team, Problem, SrcLang, Id, Arrived, INET_NTOA(Computer), Source from NewSubmits""".as[Submit])
     }
 
     case class CustomTest(id: Long, contest: Long, team: Long, language: String, source: Array[Byte], input: Array[Byte], arrived: DateTime)
+    println("b")
 
     val customTests = await {
       import slick.jdbc.MySQLProfile.api._
@@ -199,6 +197,7 @@ object DispatcherServer extends App {
     }
 
     val languageMap = languages.groupBy(_.ext).view.mapValues(_.head)
+    println("c")
 
     import MyPostgresProfile.api._
     import com.github.tototoshi.slick.PostgresJodaSupport._
@@ -211,8 +210,9 @@ object DispatcherServer extends App {
     }
 
     val insertSubmits = submits.map { c =>
+      println(c)
       sqlu"""insert into submits (contest, team_id, problem, id, language_id, source, submit_time_absolute, computer_id)
-            values (${c.contest}, ${c.team}, ${c.problem}, ${c.id}, ${c.lang}, ${c.source}, ${c.arrived}, ${c.computerID})"""
+            values (${c.contest}, ${c.team}, ${c.problem}, ${c.id}, ${c.lang}, ${c.source}, ${c.arrived}, inet(${c.computerID}))"""
     }
 
     val insertCustom = customTests.map { c =>
@@ -222,11 +222,7 @@ object DispatcherServer extends App {
     }
 
     val clearAll = Seq(
-      sqlu"""truncate table languages""",
-      sqlu"""truncate table submits""",
-      sqlu"truncate table testings",
-      sqlu"truncate table results",
-      sqlu"truncate table custom_test"
+      sqlu"""truncate table languages, submits, testings, results, custom_test cascade""",
     )
 
     val all = DBIO.sequence(clearAll ++ insertLanguages ++ insertSubmits ++ insertCustom)
@@ -236,11 +232,18 @@ object DispatcherServer extends App {
     }
   }
 
+  def fv[T](x: Future[T])(implicit ec: ExecutionContext): Future[T] = {
+    x.onComplete{ v =>
+      println(v)
+    }
+    x
+  }
+
   import ExecutionContext.Implicits.global
 
   import scala.concurrent.duration._
 
-  Await.ready(copyContests(source, dest), 30 seconds)
-  Await.ready(copyTeams(source, dest), 30 seconds)
-  Await.ready(copySubmits(source, dest), 30 seconds)
+  Await.ready(fv(copyContests(source, dest)), 30 seconds)
+  Await.ready(fv(copyTeams(source, dest)), 30 seconds)
+  Await.ready(fv(copySubmits(source, dest)), 30 seconds)
 }
